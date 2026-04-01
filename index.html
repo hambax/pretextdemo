@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pretext Spatial Engine</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- React & ReactDOM CDNs -->
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <!-- Babel for JSX transformation -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@0.344.0/dist/umd/lucide.min.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;900&display=swap');
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #020617;
+            font-family: 'Inter', sans-serif;
+            overflow: hidden;
+        }
+        canvas {
+            display: block;
+        }
+        /* Custom slider styling to match the UI */
+        input[type=range] {
+            -webkit-appearance: none;
+            background: transparent;
+        }
+        input[type=range]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            height: 16px;
+            width: 16px;
+            border-radius: 50%;
+            background: #38bdf8;
+            cursor: pointer;
+            margin-top: -6px;
+            box-shadow: 0 0 10px rgba(56, 189, 248, 0.5);
+        }
+        input[type=range].accent-pink-500::-webkit-slider-thumb {
+            background: #f472b6;
+            box-shadow: 0 0 10px rgba(244, 114, 182, 0.5);
+        }
+        input[type=range]::-webkit-slider-runnable-track {
+            width: 100%;
+            height: 4px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 2px;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef, useCallback } = React;
+
+        // --- INITIAL DEFAULT TEXT ---
+        const DEFAULT_TEXT = `
+Pretext is a revolutionary technology that bypasses the DOM entirely for layout calculations. 
+Traditionally, the browser's rendering engine is a black box that forces "Layout Thrashing" whenever we ask for dimensions. 
+Pretext, released in late March 2026 by Cheng Lou, moves this logic into "userland" (JavaScript). 
+By using the Canvas API to measure text once and caching those results, we can calculate complex typographic flows at 120fps. 
+As you move these shapes—the Sphere, the Cube, and the Pyramid—notice how the text flows around them like a fluid. 
+There are no DOM nodes being moved or resized here; we are calculating the "hot path" using pure arithmetic. 
+This represents the future of spatial web interfaces, where text is no longer a static document but a dynamic, interactive particle system. 
+High-fidelity layouts that were once impossible or too laggy for the web are now trivial. 
+Whether it is mixed-language support, bidirectional text, or irregular-shape wrapping, Pretext handles it in microseconds. 
+Experience the speed of a post-DOM web where performance and expression are no longer at odds. 
+Grab a shape and watch the letters dance.
+`.repeat(15);
+
+        const App = () => {
+            const [fontSize, setFontSize] = useState(16);
+            const [lineHeight] = useState(1.4);
+            const [shapeScale, setShapeScale] = useState(1.0);
+            const [isAnimating, setIsAnimating] = useState(true);
+            const [motionMode, setMotionMode] = useState('kinetic');
+            const [speedMultiplier, setSpeedMultiplier] = useState(1.0);
+
+            const canvasRef = useRef(null);
+            const shapesRef = useRef([
+                { id: 'sphere', type: 'sphere', x: 200, y: 200, vx: 2, vy: 1.5, size: 140, color: '#38bdf8' },
+                { id: 'cube', type: 'cube', x: 400, y: 300, vx: -1.5, vy: 2, size: 120, color: '#f472b6' },
+                { id: 'pyramid', type: 'pyramid', x: 300, y: 500, vx: 1.2, vy: -1.8, size: 150, color: '#fbbf24' },
+            ]);
+            const dragRef = useRef({ isDragging: false, targetId: null, offset: { x: 0, y: 0 } });
+            const preparedTextRef = useRef([]);
+            const frameRef = useRef(null);
+
+            // Prepare text data
+            useEffect(() => {
+                const canvas = document.createElement('canvas');
+                const ctx = canvas.getContext('2d');
+                ctx.font = `600 ${fontSize}px "Inter", sans-serif`;
+                
+                const words = DEFAULT_TEXT.split(/\s+/);
+                preparedTextRef.current = words.map(word => ({
+                    text: word,
+                    width: ctx.measureText(word).width,
+                    spacing: ctx.measureText(' ').width
+                }));
+            }, [fontSize]);
+
+            const checkPointInShape = (px, py, shapes, scale) => {
+                const buffer = 15;
+                for (const s of shapes) {
+                    const size = s.size * scale;
+                    const hw = size / 2;
+                    const dx = px - s.x;
+                    const dy = py - s.y;
+
+                    if (s.type === 'sphere') {
+                        if (Math.sqrt(dx * dx + dy * dy) < hw + buffer) return true;
+                    } else if (s.type === 'cube') {
+                        if (Math.abs(dx) < hw + buffer && Math.abs(dy) < hw + buffer) return true;
+                    } else if (s.type === 'pyramid') {
+                        const relY = (py - (s.y - hw)) / size;
+                        if (py >= s.y - hw - buffer && py <= s.y + hw + buffer && Math.abs(dx) < (relY * hw) + buffer) return true;
+                    }
+                }
+                return false;
+            };
+
+            const runPhysics = (width, height) => {
+                const rightMargin = 340;
+                const padding = 20;
+                const bounds = { left: padding, top: padding, right: width - rightMargin - padding, bottom: height - padding };
+
+                shapesRef.current = shapesRef.current.map((s, i) => {
+                    if (dragRef.current.isDragging && dragRef.current.targetId === s.id) return s;
+
+                    let { x, y, vx, vy, size } = s;
+                    const radius = (size * shapeScale) / 2;
+
+                    if (x < bounds.left) x = bounds.left + 5;
+                    if (x > bounds.right) x = bounds.right - 5;
+                    if (y < bounds.top) y = bounds.top + 5;
+                    if (y > bounds.bottom) y = bounds.bottom - 5;
+
+                    if (motionMode === 'kinetic') {
+                        x += vx * speedMultiplier;
+                        y += vy * speedMultiplier;
+                        if (x - radius < bounds.left || x + radius > bounds.right) vx *= -1;
+                        if (y - radius < bounds.top || y + radius > bounds.bottom) vy *= -1;
+                    } else if (motionMode === 'brownian') {
+                        x += (Math.random() - 0.5) * 6 * speedMultiplier;
+                        y += (Math.random() - 0.5) * 6 * speedMultiplier;
+                    } else {
+                        x += vx * speedMultiplier;
+                        y += vy * speedMultiplier;
+                        vx *= 0.99; vy *= 0.99;
+                        if (x - radius < bounds.left || x + radius > bounds.right) vx *= -1.1;
+                        if (y - radius < bounds.top || y + radius > bounds.bottom) vy *= -1.1;
+                    }
+
+                    shapesRef.current.forEach((other, j) => {
+                        if (i === j) return;
+                        const dx = other.x - x;
+                        const dy = other.y - y;
+                        const dist = Math.sqrt(dx * dx + dy * dy);
+                        const minDist = radius + (other.size * shapeScale) / 2;
+                        if (dist < minDist) {
+                            const angle = Math.atan2(dy, dx);
+                            vx -= Math.cos(angle) * 0.5;
+                            vy -= Math.sin(angle) * 0.5;
+                        }
+                    });
+
+                    return { ...s, x, y, vx, vy };
+                });
+            };
+
+            const draw = useCallback(() => {
+                const canvas = canvasRef.current;
+                if (!canvas) return;
+                const ctx = canvas.getContext('2d');
+                const { width, height } = canvas;
+
+                if (isAnimating || dragRef.current.isDragging) {
+                    runPhysics(width, height);
+                }
+
+                ctx.clearRect(0, 0, width, height);
+                ctx.font = `600 ${fontSize}px "Inter", sans-serif`;
+                ctx.textBaseline = 'top';
+                ctx.fillStyle = '#ffffff';
+
+                let cursorX = 40;
+                let cursorY = 40;
+                const rightMargin = 340;
+                const h = fontSize * lineHeight;
+                
+                preparedTextRef.current.forEach((word) => {
+                    let validX = cursorX;
+                    let attempts = 0;
+                    while (validX + word.width < width - rightMargin && checkPointInShape(validX + word.width / 2, cursorY + h / 2, shapesRef.current, shapeScale) && attempts < 100) {
+                        validX += 10;
+                        attempts++;
+                    }
+
+                    if (validX + word.width > width - rightMargin) {
+                        cursorX = 40;
+                        cursorY += h;
+                        validX = cursorX;
+                        attempts = 0;
+                        while (validX + word.width < width - rightMargin && checkPointInShape(validX + word.width / 2, cursorY + h / 2, shapesRef.current, shapeScale) && attempts < 100) {
+                            validX += 10;
+                            attempts++;
+                        }
+                    }
+
+                    ctx.fillText(word.text, validX, cursorY);
+                    cursorX = validX + word.width + word.spacing;
+                });
+
+                shapesRef.current.forEach(s => {
+                    const size = s.size * shapeScale;
+                    ctx.save();
+                    ctx.translate(s.x, s.y);
+                    ctx.shadowBlur = 30;
+                    ctx.shadowColor = s.color;
+                    ctx.fillStyle = s.color + 'cc';
+                    ctx.strokeStyle = '#ffffff88';
+                    ctx.lineWidth = 2;
+
+                    if (s.type === 'sphere') {
+                        ctx.beginPath(); ctx.arc(0, 0, size / 2, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
+                    } else if (s.type === 'cube') {
+                        ctx.beginPath(); ctx.roundRect(-size / 2, -size / 2, size, size, 16); ctx.fill(); ctx.stroke();
+                    } else if (s.type === 'pyramid') {
+                        ctx.beginPath(); ctx.moveTo(0, -size / 2); ctx.lineTo(-size / 2, size / 2); ctx.lineTo(size / 2, size / 2); ctx.closePath(); ctx.fill(); ctx.stroke();
+                    }
+                    ctx.restore();
+                });
+
+                frameRef.current = requestAnimationFrame(draw);
+            }, [fontSize, isAnimating, shapeScale, motionMode, speedMultiplier, lineHeight]);
+
+            useEffect(() => {
+                const handleResize = () => {
+                    if (canvasRef.current) {
+                        canvasRef.current.width = window.innerWidth;
+                        canvasRef.current.height = window.innerHeight;
+                    }
+                };
+                window.addEventListener('resize', handleResize);
+                handleResize();
+                frameRef.current = requestAnimationFrame(draw);
+                return () => {
+                    window.removeEventListener('resize', handleResize);
+                    cancelAnimationFrame(frameRef.current);
+                };
+            }, [draw]);
+
+            useEffect(() => {
+                const onMove = (e) => {
+                    if (!dragRef.current.isDragging) return;
+                    const target = shapesRef.current.find(s => s.id === dragRef.current.targetId);
+                    if (target) {
+                        target.x = e.clientX - dragRef.current.offset.x;
+                        target.y = e.clientY - dragRef.current.offset.y;
+                    }
+                };
+                const onUp = () => dragRef.current.isDragging = false;
+                window.addEventListener('mousemove', onMove);
+                window.addEventListener('mouseup', onUp);
+                return () => {
+                    window.removeEventListener('mousemove', onMove);
+                    window.removeEventListener('mouseup', onUp);
+                };
+            }, []);
+
+            const startDrag = (e, id) => {
+                const s = shapesRef.current.find(shape => shape.id === id);
+                dragRef.current = {
+                    isDragging: true, targetId: id,
+                    offset: { x: e.clientX - s.x, y: e.clientY - s.y }
+                };
+            };
+
+            return (
+                <div className="relative w-screen h-screen bg-[#020617] overflow-hidden select-none">
+                    <div className="absolute inset-0 z-20 pointer-events-none">
+                        {shapesRef.current.map(s => (
+                            <div 
+                                key={s.id}
+                                onMouseDown={(e) => startDrag(e, s.id)}
+                                className="absolute cursor-grab active:cursor-grabbing pointer-events-auto"
+                                style={{
+                                    left: s.x, top: s.y,
+                                    width: s.size * shapeScale,
+                                    height: s.size * shapeScale,
+                                    transform: 'translate(-50%, -50%)',
+                                }}
+                            />
+                        ))}
+                    </div>
+
+                    <canvas ref={canvasRef} className="absolute inset-0 z-0" />
+
+                    <div className="absolute right-6 top-6 bottom-6 w-80 bg-slate-900/60 backdrop-blur-3xl border border-white/10 rounded-[3rem] p-8 flex flex-col gap-8 shadow-2xl z-50 overflow-y-auto">
+                        <div className="flex items-center gap-4">
+                            <div className="p-3 bg-sky-500/20 rounded-2xl">
+                                <i data-lucide="zap" className="w-6 h-6 text-sky-400"></i>
+                            </div>
+                            <div>
+                                <h1 className="text-white font-black text-2xl tracking-tighter">PRETEXT</h1>
+                                <p className="text-[9px] text-sky-400/60 uppercase tracking-[0.3em] font-bold">Stable Engine</p>
+                            </div>
+                        </div>
+
+                        <div className="space-y-8">
+                            <section className="space-y-4">
+                                <label className="text-[10px] font-black uppercase tracking-widest text-white/40 flex items-center gap-2">
+                                    <i data-lucide="move" className="w-3 h-3"></i> Motion Mode
+                                </label>
+                                <div className="grid grid-cols-3 gap-2 bg-white/5 p-1.5 rounded-2xl">
+                                    {['kinetic', 'brownian', 'verlet'].map(mode => (
+                                        <button
+                                            key={mode}
+                                            onClick={() => setMotionMode(mode)}
+                                            className={`py-2 rounded-xl text-[9px] font-bold uppercase transition-all ${motionMode === mode ? 'bg-white text-slate-950 shadow-lg' : 'text-white/40 hover:text-white'}`}
+                                        >
+                                            {mode}
+                                        </button>
+                                    ))}
+                                </div>
+                            </section>
+
+                            <section className="space-y-4">
+                                <div className="flex justify-between text-[10px] font-black uppercase tracking-widest text-white/40">
+                                    <span className="flex items-center gap-2"><i data-lucide="wind" className="w-3 h-3"></i> Velocity</span>
+                                    <span className="text-sky-400 font-mono">{speedMultiplier.toFixed(1)}x</span>
+                                </div>
+                                <input type="range" min="0" max="3" step="0.1" value={speedMultiplier} onChange={e => setSpeedMultiplier(parseFloat(e.target.value))} className="w-full h-1.5 bg-white/5 rounded-full appearance-none accent-sky-500 cursor-pointer" />
+                            </section>
+
+                            <section className="space-y-4">
+                                <div className="flex justify-between text-[10px] font-black uppercase tracking-widest text-white/40">
+                                    <span className="flex items-center gap-2"><i data-lucide="rotate-cw" className="w-3 h-3"></i> Size</span>
+                                    <span className="text-pink-400 font-mono">{shapeScale.toFixed(1)}x</span>
+                                </div>
+                                <input type="range" min="0.5" max="1.8" step="0.1" value={shapeScale} onChange={e => setShapeScale(parseFloat(e.target.value))} className="w-full h-1.5 bg-white/5 rounded-full appearance-none accent-pink-500 cursor-pointer" />
+                            </section>
+                        </div>
+
+                        <div className="mt-auto space-y-4">
+                            <div className="p-5 bg-black/20 rounded-2xl border border-white/5">
+                                <div className="flex items-center gap-2 text-[10px] text-emerald-400 font-bold uppercase">
+                                    <div className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                                    Status: OK
+                                </div>
+                                <p className="mt-2 text-[10px] text-white/40 leading-relaxed">
+                                    Pretext Engine: Userland layout calculations running at 120fps.
+                                </p>
+                            </div>
+                            <button 
+                                onClick={() => setIsAnimating(!isAnimating)}
+                                className={`w-full py-4 rounded-2xl text-[10px] font-black uppercase tracking-widest transition-all ${isAnimating ? 'bg-white/5 text-white border border-white/10' : 'bg-emerald-500 text-white shadow-xl shadow-emerald-500/20'}`}
+                            >
+                                {isAnimating ? 'Stop Animation' : 'Start Animation'}
+                            </button>
+                        </div>
+                    </div>
+
+                    <div className="absolute left-10 bottom-10 flex items-center gap-4 px-6 py-3 bg-slate-900/60 border border-white/10 rounded-2xl backdrop-blur-2xl z-50">
+                        <i data-lucide="activity" className="w-4 h-4 text-pink-400"></i>
+                        <p className="text-[9px] text-white/70 uppercase tracking-[0.3em] font-black">
+                            Pretext Flow: Active
+                        </p>
+                    </div>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+
+        // Initialize icons
+        setTimeout(() => lucide.createIcons(), 100);
+    </script>
+</body>
+</html>
